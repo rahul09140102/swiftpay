@@ -1,0 +1,201 @@
+name: SwiftPay CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY:        ghcr.io
+  IMAGE_PREFIX:    ${{ github.repository_owner }}/swiftpay
+  JAVA_VERSION:    "21"
+
+jobs:
+  # ── Job 1: Compile & Unit Tests ──────────────────────────────────────────────
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: swiftpay
+          POSTGRES_PASSWORD: swiftpay_secret
+          POSTGRES_DB: swiftpay_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U swiftpay"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compile all modules
+        run: mvn -B compile --no-transfer-progress
+
+      - name: Run unit tests
+        run: mvn -B test --no-transfer-progress -Dspring.profiles.active=test
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/swiftpay_test
+          SPRING_DATASOURCE_USERNAME: swiftpay
+          SPRING_DATASOURCE_PASSWORD: swiftpay_secret
+
+      - name: Publish test report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name:    JUnit Test Results
+          path:    "**/target/surefire-reports/*.xml"
+          reporter: java-junit
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: "**/target/site/jacoco/jacoco.xml"
+
+  # ── Job 2: Integration Tests (Testcontainers) ───────────────────────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Run integration tests (Testcontainers)
+        run: |
+          mvn -B verify --no-transfer-progress \
+              -Dsurefire.failIfNoSpecifiedTests=false \
+              -Pfailsafe \
+              -Dspring.profiles.active=integration
+
+  # ── Job 3: Build & Push Docker Images ───────────────────────────────────────
+  docker-build-push:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [build-and-test, integration-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        service: [transaction-gateway, ledger-service, analytics-worker]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Build JAR (skip tests)
+        run: |
+          mvn -B package -DskipTests --no-transfer-progress \
+              -pl common,${{ matrix.service }} -am
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.service }}/Dockerfile
+          build-args: |
+            SERVICE_NAME=${{ matrix.service }}
+          push: true
+          tags:   ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ── Job 4: Smoke Test (docker-compose) ──────────────────────────────────────
+  smoke-test:
+    name: Docker Compose Smoke Test
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: |
+          docker-compose up -d --build
+          echo "Waiting for services to be healthy..."
+          sleep 90
+
+      - name: Health check — Gateway
+        run: |
+          curl -sf http://localhost:8080/actuator/health | grep '"status":"UP"'
+
+      - name: Health check — Ledger
+        run: |
+          curl -sf http://localhost:8081/actuator/health | grep '"status":"UP"'
+
+      - name: Health check — Analytics
+        run: |
+          curl -sf http://localhost:8082/actuator/health | grep '"status":"UP"'
+
+      - name: End-to-end payment flow test
+        run: |
+          # Initiate a payment
+          RESPONSE=$(curl -sf -X POST http://localhost:8080/v1/payments \
+            -H "Content-Type: application/json" \
+            -H "Idempotency-Key: smoke-test-$(date +%s)" \
+            -d '{
+              "sender_id":   "550e8400-e29b-41d4-a716-446655440001",
+              "receiver_id": "550e8400-e29b-41d4-a716-446655440002",
+              "amount": "10.00",
+              "currency": "USD"
+            }')
+          echo "Payment response: $RESPONSE"
+          echo $RESPONSE | grep -q '"status":"PENDING"' && echo "✓ Smoke test PASSED"
+
+      - name: Tear down
+        if: always()
+        run: docker-compose down -v

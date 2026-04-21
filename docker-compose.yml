@@ -1,0 +1,192 @@
+version: "3.9"
+
+# ── SwiftPay Full Stack ──────────────────────────────────────────────────────
+# Usage:  docker-compose up --build
+# Swagger UIs:
+#   Gateway   → http://localhost:8080/swagger-ui.html
+#   Ledger    → http://localhost:8081/swagger-ui.html
+#   Analytics → http://localhost:8082/swagger-ui.html
+
+x-common-env: &kafka-env
+  KAFKA_BROKERS: kafka:9092
+
+x-common-pg: &pg-env
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USER: swiftpay
+  DB_PASSWORD: swiftpay_secret
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: swiftpay-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: swiftpay
+      POSTGRES_PASSWORD: swiftpay_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swiftpay"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Zookeeper ───────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: swiftpay-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zk_data:/var/lib/zookeeper/data
+      - zk_log:/var/lib/zookeeper/log
+
+  # ── Kafka ───────────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: swiftpay-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_started
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── Kafka UI ────────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: swiftpay-kafka-ui
+    depends_on: [kafka]
+    ports:
+      - "9000:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: swiftpay-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: swiftpay-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Transaction Gateway (Service A) ─────────────────────────────────────────
+  transaction-gateway:
+    build:
+      context: .
+      dockerfile: transaction-gateway/Dockerfile
+      args:
+        SERVICE_NAME: transaction-gateway
+    container_name: swiftpay-gateway
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: [*kafka-env, *pg-env]
+      DB_NAME: swiftpay_gateway
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      LEDGER_SERVICE_URL: http://ledger-service:8081
+      SPRING_PROFILES_ACTIVE: docker
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # ── Ledger Service (Service B) ───────────────────────────────────────────────
+  ledger-service:
+    build:
+      context: .
+      dockerfile: ledger-service/Dockerfile
+      args:
+        SERVICE_NAME: ledger-service
+    container_name: swiftpay-ledger
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: [*kafka-env, *pg-env]
+      DB_NAME: swiftpay_ledger
+      SPRING_PROFILES_ACTIVE: docker
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # ── Analytics Worker (Service C) ─────────────────────────────────────────────
+  analytics-worker:
+    build:
+      context: .
+      dockerfile: analytics-worker/Dockerfile
+      args:
+        SERVICE_NAME: analytics-worker
+    container_name: swiftpay-analytics
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: [*kafka-env, *pg-env]
+      DB_NAME: swiftpay_analytics
+      SPRING_PROFILES_ACTIVE: docker
+    ports:
+      - "8082:8082"
+
+volumes:
+  postgres_data:
+  kafka_data:
+  zk_data:
+  zk_log:
+  redis_data:

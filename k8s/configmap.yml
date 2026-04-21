@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swiftpay-config
+  namespace: swiftpay
+data:
+  KAFKA_BROKERS: "kafka-service:9092"
+  DB_HOST: "postgres-service"
+  DB_PORT: "5432"
+  DB_USER: "swiftpay"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  LEDGER_SERVICE_URL: "http://ledger-service:8081"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: swiftpay-secrets
+  namespace: swiftpay
+type: Opaque
+stringData:
+  DB_PASSWORD: "swiftpay_secret"

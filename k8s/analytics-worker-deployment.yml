@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-worker
+  namespace: swiftpay
+  labels:
+    app: analytics-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: analytics-worker}
+  template:
+    metadata:
+      labels: {app: analytics-worker}
+    spec:
+      containers:
+        - name: analytics-worker
+          image: swiftpay/analytics-worker:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {containerPort: 8082, name: http}
+          envFrom:
+            - configMapRef:  {name: swiftpay-config}
+            - secretRef:     {name: swiftpay-secrets}
+          env:
+            - {name: DB_NAME,       value: swiftpay_analytics}
+            - {name: SERVER_PORT,   value: "8082"}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits:   {cpu: 500m, memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-worker
+  namespace: swiftpay
+spec:
+  type: NodePort
+  selector: {app: analytics-worker}
+  ports:
+    - port: 8082
+      targetPort: 8082
+      nodePort: 30082
